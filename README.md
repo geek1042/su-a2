@@ -316,7 +316,8 @@ IIT Jodhpur. Roll No: M25DE1042.
 - [Meta NLLB-200](https://huggingface.co/facebook/nllb-200-distilled-600M) — English-to-Urdu translation  
 - [Meta MMS-TTS](https://huggingface.co/facebook/mms-tts-urd) — Urdu speech synthesis  
 - [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) — Noise suppression  
-- [dtw-python](https://github.com/DynamicTimeWarping/dtw-python) — DTW alignment  
+- [dtw-python](https://github.com/DynamicTimeWarping/dtw-python) — DTW alignment
+- [https://huggingface.co/datasets/ai4bharat/IndicVoices/tree/main/urdu] — Voice dataset paraquet data file. 
 
 ---
 
