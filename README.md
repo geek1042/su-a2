@@ -4,6 +4,7 @@
 **Programme:** MTech Data Engineering | **Institution:** IIT Jodhpur  
 **Course:** Speech Understanding Using AI  
 
+GOOGLE DRIVE LINK : https://drive.google.com/drive/u/2/folders/1LqZ9kUZ4knK1YSqwfbo-hI9PkwMIOR2C
 ---
 
 ## What Is This Project?
@@ -71,6 +72,8 @@ Speech_A2/
 │   └── adversarial_plot.png        # Figure 6: FGSM adversarial confidence plot
 │
 ├── dictionary.csv                  # Hinglish bilingual lexicon
+├── analysis_and_results.md         # Analaysis and results
+├── assignment_overview             # OVerview of the assignment
 ├── requirements.txt                # Python dependencies
 ├── M25DE1042_Speech_A2_Report.tex  # Full academic report (LaTeX source)
 └── README.md                       # This file
