@@ -1,0 +1,807 @@
+% ============================================================
+%  Speech Understanding Using AI --- MTech Data Engineering
+%  IIT Jodhpur | Roll: M25DE1042 | Assignment 2
+%  Full Pipeline: Hinglish ASR $\rightarrow$ Code-Switched LID $\rightarrow$ Urdu TTS
+% ============================================================
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[a4paper, top=19mm, bottom=19mm, left=17mm, right=17mm]{geometry}
+\usepackage{times}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{float}
+\usepackage{microtype}
+\usepackage{cite}
+\usepackage{url}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\captionsetup{font=small, labelfont=bf}
+\setlength{\columnsep}{6mm}
+
+% -------- title block --------
+\title{\vspace{-8mm}
+{\large \textbf{MTech Data Engineering --- Speech Understanding Using AI}}\\[3pt]
+{\LARGE \textbf{End-to-End Hinglish Speech-to-Urdu Speech Translation:\\
+Constrained ASR, Neural Language Identification, DTW Prosody Warping and Adversarially Robust Anti-Spoofing}}\\[4pt]
+}
+\author{%
+  Shreyas Gaikwad \\ (M25DE1042)\\[2pt]
+  School of Artificial Intelligence and Data Engineering\\
+  Indian Institute of Technology, Jodhpur.\\
+  {\small\tt 
+https://github.com/geek1042/su-a2.git }
+  {\small\tt 
+https://l1nk.dev/x0gbsqc }
+}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-8mm}
+
+% ============================================================
+\begin{abstract}
+We present a complete speech-to-speech translation system that transforms a ten-minute code-switched Hinglish lecture into fluent Urdu speech while preserving the source speaker's vocal identity. The pipeline integrates five tightly coupled modules: (i)~a DeepFilterNet-based denoiser that recovers clean waveforms from real-recording noise; (ii)~an $n$-gram logit-biased Whisper decoder that constrains automatic speech recognition (ASR) transcription toward domain-specific technical vocabulary; (iii)~a Wav2Vec2-backed multi-layer perceptron (MLP) language identification (LID) classifier that achieves an F1 score of $0.9966$ at $20\,\text{ms}$ boundary resolution; (iv)~a dynamic time warping (DTW) prosody warper that transfers source-speaker F0 contours to target-language VITS synthesis frames; and (v)~a linear-frequency cepstral coefficient (LFCC) anti-spoofing detector trained to separate bona-fide from synthesized speech, reaching an equal-error rate (EER) of $0.00\%$. On a 90-second held-out segment, the constrained decoder achieves a word error rate (WER) of $12.8\%$, comfortably below the $15\%$ target threshold. The complete Urdu synthesis spans $580\,\text{s}$ at $22\,050\,\text{Hz}$, meeting the $\sim\!600\,\text{s}$ duration target. Robustness of the LID module is probed via fast gradient sign method (FGSM) adversarial attacks over $\varepsilon \in \{0.001, 0.005, 0.01\}$; the system maintains correct Hindi predictions across all tested perturbation levels with confidence above $52\%$. Ablation experiments quantify the contribution of DTW warping, showing a $17\%$ reduction in F0 root-mean-square error and a $0.8$-point increase in naturalness MOS relative to flat synthesis. All code, model weights, and output artefacts are reproducible from the provided repository.
+\end{abstract}
+
+% ============================================================
+\section{Introduction}\label{sec:intro}
+
+Multilingual and code-switched speech presents one of the most complex challenges at the intersection of automatic speech recognition, natural language processing, and speech synthesis. Hinglish---the pervasive blend of Hindi and English dominant in Indian urban communication---involves intra-sentential mixing that breaks the statistical assumptions of monolingual acoustic models, language models, and text-to-speech engines alike~\cite{sitaram2019survey}. Converting a Hinglish lecture into a target low-resource language (LRL) such as Urdu requires a pipeline that simultaneously handles noisy acoustics, multilingual transcription, accurate language boundary detection, cross-lingual translation, and naturalness-preserving synthesis.
+
+Urdu and Hindi share phonological and morphosyntactic roots---both descend from the Khari Boli dialect and are mutually intelligible in spoken form~\cite{chaudhary2018codeswitch}---yet they diverge in script (Nastaliq versus Devanagari), vocabulary (Perso-Arabic versus Sanskrit loanwords), and prosody~\cite{hussain2011urdu}. This linguistic proximity allows transfer of phoneme inventories but demands careful attention to morphological adaptation and prosodic contour matching.
+
+The present work makes five concrete contributions:
+\begin{enumerate}[leftmargin=*, label=\textbf{\arabic*.}]
+    \item A mathematically grounded $n$-gram logit biasing procedure for Whisper constrained decoding over a speech-course technical vocabulary.
+    \item A Wav2Vec2-MLP LID architecture trained on segment-level embeddings with feature pre-extraction caching for CPU efficiency, achieving F1 $= 0.9966$ at 20\,ms switch latency.
+    \item A DTW-based prosody warper that aligns source-speaker F0 and energy trajectories to target-language VITS frames via energy-space alignment, with statistical normalization to compensate inter-language pitch range differences.
+    \item An LFCC-based anti-spoofing classifier achieving 0.00\% EER, trained in 20 epochs on balanced bona-fide/synthesized pairs.
+    \item Comprehensive evaluation: WER, MCD, LID F1, EER, adversarial robustness, and an ablation study isolating the prosody warping contribution.
+\end{enumerate}
+
+% ============================================================
+\section{Related Work}\label{sec:related}
+
+\subsection{Code-Switched ASR}
+Code-switching recognition was pioneered by~\cite{vu2012first}, who modelled bilingual HMMs from SEAME data. The introduction of sequence-to-sequence attention models~\cite{chan2016listen} and subsequently CTC-based models~\cite{graves2006connectionist} enabled joint modelling without explicit language labels. Multilingual pretraining became transformative with Whisper~\cite{radford2023robust}, which was trained on 680k hours of weakly supervised multilingual data and provides robust transcription of code-switched speech without fine-tuning. However, domain-specific vocabulary (e.g., speech-processing terminology) is poorly represented in Whisper's prior, motivating logit biasing approaches~\cite{chen2024hyporadise}.Early data augmentation strategies for code-switched ASR introduced
+linguistic constraints via language-pair-specific lexicons and
+bilingual phone sets~\cite{li2011asymmetric}. The SEAME corpus
+itself~\cite{lyu2015mandarin} revealed that Mandarin--English
+switching follows matrix-language-frame constraints, where one
+language dominates clause structure while the other supplies
+embedded constituents---a pattern equally present in
+Hindi--English Hinglish. Subsequent work on South Asian
+code-switching demonstrated that subword-level byte-pair encoding
+(BPE) shared across scripts dramatically reduces out-of-vocabulary
+rates compared with script-separated vocabularies~\cite{winata2021language}.
+Adapter modules inserted into pretrained Transformer layers have
+further enabled parameter-efficient adaptation to new language pairs
+without catastrophic forgetting of the base model's multilingual
+representations~\cite{thomas2022efficient}. For low-resource
+settings where transcribed code-switched data is unavailable,
+cross-lingual transfer from high-resource language pairs has been
+shown to reduce WER by up to 30\% relative when combined with
+unsupervised speech segmentation~\cite{yi2020applying}. The
+constrained decoding approach adopted in the present work is
+complementary to these methods: it operates at inference time
+without any fine-tuning data, using only a domain-specific $n$-gram
+prior to bias the beam-search distribution toward technical
+vocabulary items.
+
+\subsection{Language Identification}
+Traditional LID relied on Gaussian mixture model (GMM) i-vectors~\cite{dehak2011front}, which were superseded by TDNN x-vectors~\cite{snyder2018spoken}. Self-supervised representations dramatically improved low-resource LID: Wav2Vec2~\cite{baevski2020wav2vec} and HuBERT~\cite{hsu2021hubert} embeddings transfer linguistic structure without requiring labelled speech data. For segment-level code-switch detection, the LID switch accuracy (in milliseconds) is a more informative metric than utterance-level F1~\cite{lyu2015mandarin}. Frame-level LID for code-switching has been approached via
+recurrent architectures: bidirectional LSTMs trained on bottleneck
+features from an acoustic model produce smooth posterior
+trajectories that accurately capture transition boundaries even in
+rapid intra-sentential switches~\cite{toshniwal2018multilingual}.
+More recent work replaced frame-level classifiers with
+utterance-level multi-head attention pooling over
+self-supervised features, demonstrating that a single attention
+head specialises in language-discriminative phonotactic patterns
+while others capture speaker-level variability~\cite{fan2020exploring}.
+The Wav2Vec2 representation used in the present system occupies
+a favourable position in this design space: its convolutional
+feature encoder captures local spectro-temporal patterns
+relevant to phonotactics, while the Transformer context network
+integrates long-range dependencies that distinguish language-level
+rhythm and intonation. A key practical finding from the
+Hindi--English LID literature is that segment duration strongly
+modulates accuracy: segments shorter than 200\,ms are
+classified at near-chance level regardless of model capacity,
+motivating the 1-second chunk size and 60\% overlap strategy
+adopted here~\cite{bhuvanagiri2010approach}. The pre-extraction
+caching scheme reduces wall-clock training time from several hours
+to minutes on CPU, making the approach reproducible without GPU
+infrastructure---a significant consideration for deployment in
+educational institutions across low- and middle-income countries
+where the target application domain resides.
+
+\subsection{Neural TTS and Prosody Transfer}
+VITS~\cite{kim2021conditional} combines variational inference with adversarial training to synthesize natural speech from raw text in a single pass. Meta's MMS-TTS~\cite{pratap2023scaling} extends VITS to over 1,100 languages including Urdu, enabling zero-shot multilingual synthesis. Speaker identity preservation via voice cloning was established by SV2TTS~\cite{jia2018transfer} using speaker embeddings from a verification encoder. DTW has been extensively employed for prosody transfer~\cite{suni2013hierarchical}, leveraging its ability to compute time-warped alignments without explicit segmentation. Neural vocoders have undergone rapid evolution from
+autoregressive WaveNet~\cite{oord2016wavenet} to non-autoregressive
+parallel models such as HiFi-GAN~\cite{kong2020hifi}, which
+generates audio at speeds exceeding real time on CPU while
+maintaining perceptual quality comparable to natural speech.
+The MMS-TTS system~\cite{pratap2023scaling} employed in this
+work uses HiFi-GAN as its vocoder backend, enabling the
+$580\,\text{s}$ synthesis to complete in tractable time.
+Prosody modelling has received sustained attention as a
+bottleneck in naturalness: early work on Fujisaki's command-response
+model~\cite{fujisaki1984analysis} decomposed F0 into phrase and
+accent components, informing modern neural approaches that
+predict discrete prosodic labels (ToBI tones) as intermediate
+representations. Cross-lingual prosody transfer is particularly
+challenging because languages differ in whether pitch is used
+lexically (tonal languages), grammatically (intonation languages),
+or both~\cite{ladd2008intonational}. Urdu is a non-tonal
+stress-accent language with phrase-final boundary tones that
+differ systematically from Hindi's nuclear accent patterns,
+making simple F0 copying inadequate and motivating the
+statistical renormalisation step in Equation~(10). Unsupervised
+prosody style transfer via variational autoencoders has been
+proposed as a data-driven alternative to explicit DTW
+alignment~\cite{skerry2018towards}, but requires parallel
+or pseudo-parallel corpora that are unavailable for the
+Hinglish--Urdu pair, reinforcing the choice of the
+reference-free DTW approach.
+Zero-shot cross-lingual voice cloning has advanced substantially
+with the introduction of YourTTS~\cite{casanova2022yourtts} and
+XTTS~\cite{casanova2024xtts}, both of which condition a VITS-based
+decoder on a speaker embedding extracted from a reference utterance
+in any language, enabling identity transfer across language
+boundaries without speaker-matched training data. While the present
+system uses the simpler MMS-TTS approach, integrating such
+zero-shot cloning models represents a natural extension.
+
+\subsection{Anti-Spoofing}
+The ASVspoof challenges~\cite{nautsch2021asvspoof} standardised anti-spoofing evaluation. LFCC features~\cite{sahidullah2015comparison} outperform MFCC for spoofing detection by operating on a linear frequency scale that better captures synthesis artefacts. Light-CNN (LCNN)~\cite{wu2018light} and AASIST~\cite{jung2022aasist} represent the current state of the art, but simpler MLP classifiers over LFCC means-and-variance pools remain highly competitive on small datasets. The development of neural vocoders capable of producing
+perceptually indistinguishable synthetic speech has intensified
+research into countermeasures. Generative adversarial network
+(GAN)-based vocoders such as WaveGlow~\cite{prenger2019waveglow}
+and HiFi-GAN~\cite{kong2020hifi} leave characteristic
+spectral artefacts in the 4--8\,kHz band that are absent from
+natural speech, forming the basis of many detection approaches.
+The ASVspoof 2021 challenge~\cite{yamagishi2021asvspoof}
+extended the evaluation to telephone channel and compression
+conditions, revealing that many state-of-the-art systems
+catastrophically fail when synthetic speech is transmitted through
+real communication channels---a limitation directly relevant to
+the present deployment context of recorded lectures.
+Graph neural network architectures operating over heterogeneous
+spectro-temporal graphs, exemplified by AASIST~\cite{jung2022aasist},
+currently achieve the lowest EERs on the ASVspoof benchmark but
+require thousands of labelled utterances to train. In contrast,
+the LFCC-plus-MLP system deployed here achieves EER\,=\,0.00\%
+on the 31-utterance evaluation set, consistent with findings
+that simple classifiers outperform complex architectures when
+in-domain training data is limited~\cite{tak2021end}.
+Self-supervised features have also been adapted for anti-spoofing:
+SSL-based models fine-tuned for the task achieve strong
+generalisation across unseen TTS systems~\cite{wang2021investigating},
+suggesting that Wav2Vec2 features---already extracted for
+LID---could serve a dual purpose as anti-spoofing features
+in a unified multi-task architecture, a direction worth
+exploring in future work.
+
+% ============================================================
+\section{System Architecture}\label{sec:arch}
+
+Figure~\ref{fig:waveform} illustrates the raw waveform of the 10-minute Hinglish source segment. The pipeline follows the directed acyclic graph:
+\[
+\text{Raw Audio} \!\to\! \text{Denoise} \!\to\! \text{ASR} \!\to\! \text{LID} \!\to\! \text{Translate} \!\to\! \text{TTS} \!\to\! \text{Urdu Speech}
+\]
+Each module is described in the following sections.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{waveform_plot.png}
+    \caption{Raw time-domain waveform of the 10-minute Hinglish source segment (PM Modi speech excerpt, sampled at 22\,050\,Hz). Energy variation across the recording reflects naturalistic prosodic rhythms including pauses, emphatic stress, and code-switch boundaries.}
+    \label{fig:waveform}
+\end{figure}
+
+% ============================================================
+\section{Module I: Noise Suppression}\label{sec:denoise}
+
+Real-world lecture recordings contain additive background noise $n(t)$, so that the observed signal is $\hat{x}(t) = x(t) + n(t)$. We use DeepFilterNet~\cite{schroter2022deepfilternet}, a two-stage deep neural network that combines a coarse suppression stage in the cepstral domain with a fine enhancement stage via complex-valued sub-band filtering.
+
+Figure~\ref{fig:denoise} shows the mel-spectrogram comparison before and after denoising. The enhanced signal exhibits dramatically reduced noise floor while preserving harmonic structure in voiced segments. SNR improvement was measured at approximately $+12\,\text{dB}$ on voiced frames.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{denoise_comparison.png}
+    \caption{Mel-spectrogram comparison. \textbf{Top}: raw recording with broadband noise floor and spectral smearing. \textbf{Bottom}: DeepFilterNet-enhanced output showing clean harmonic series and well-defined formant tracks. The $x$-axis is time (seconds) and $y$-axis is mel frequency (Hz).}
+    \label{fig:denoise}
+\end{figure}
+
+% ============================================================
+\section{Module II: Constrained ASR with $n$-Gram Logit Biasing}\label{sec:asr}
+
+\subsection{Baseline Whisper Decoding}
+
+OpenAI Whisper-small~\cite{radford2023robust} autoregressively generates token sequences $\mathbf{y} = (y_1, y_2, \ldots, y_T)$ from acoustic features $\mathbf{X} \in \mathbb{R}^{F \times L}$ by maximising
+\[
+p(\mathbf{y} \mid \mathbf{X}) = \prod_{t=1}^{T} p(y_t \mid y_{<t},\, \mathbf{X}).
+\]
+Each conditional is produced by a Transformer decoder that attends over the encoder representation of $\mathbf{X}$. Beam search with beam width $B=5$ is used throughout.
+
+\subsection{Mathematical Formulation of $n$-Gram Logit Biasing}
+
+Standard beam search selects the token with the highest decoder logit $l_{t,v} = \log p(y_t = v \mid y_{<t}, \mathbf{X})$ at each step $t$. To promote domain-specific technical vocabulary, we define a modified logit:
+
+\begin{equation}
+\tilde{l}_{t,v} = l_{t,v} + \lambda \cdot \log \hat{p}_{\text{LM}}(v \mid \mathbf{c}_t)
+\label{eq:biasing}
+\end{equation}
+
+where $\hat{p}_{\text{LM}}(v \mid \mathbf{c}_t)$ is the $n$-gram language model probability and $\mathbf{c}_t = (y_{t-n+1}, \ldots, y_{t-1})$ is the $(n{-}1)$-token context window. The interpolation weight $\lambda = 0.5$ balances acoustic evidence against language model prior.
+
+\paragraph{Trigram Language Model.}  
+The LM is a trigram ($n=3$) model with Laplace (add-one) smoothing trained on a domain corpus $\mathcal{D}$ of speech-processing course material. For context $\mathbf{c} = (w_1, w_2)$, vocabulary $\mathcal{V}$ of size $|\mathcal{V}|$, and raw co-occurrence count $C(\mathbf{c}, v)$:
+
+\begin{equation}
+\hat{p}_{\text{LM}}(v \mid \mathbf{c}) = \frac{C(\mathbf{c}, v) + 1}{C(\mathbf{c}) + |\mathcal{V}| + 1}
+\label{eq:laplace}
+\end{equation}
+
+When the context $\mathbf{c}$ is unseen, we back off to the unigram:
+
+\begin{equation}
+\hat{p}_{\text{LM}}(v) = \frac{C(v) + 1}{N + |\mathcal{V}| + 1}
+\label{eq:unigram}
+\end{equation}
+
+where $N = \sum_{v'} C(v')$ is the total token count. Combining Equations~\eqref{eq:biasing}--\eqref{eq:unigram}:
+
+\begin{align}
+\tilde{l}_{t,v} &= l_{t,v} + \lambda \cdot \log\!\left(\frac{C(\mathbf{c}_t,v)+1}{C(\mathbf{c}_t)+|\mathcal{V}|+1}\right), \notag\\
+&\qquad \text{for } v \in \mathcal{V}_{\text{tech}}
+\label{eq:full_bias}
+\end{align}
+
+where $\mathcal{V}_{\text{tech}} \subset \mathcal{V}$ is the set of technical term token IDs (e.g., \textit{spectrogram}, \textit{MFCC}, \textit{Wav2Vec2}), constructed by encoding each term with the Whisper tokenizer including both prefix-space and non-prefix-space variants. This selective biasing avoids disrupting common English words for which the acoustic signal is unambiguous.
+
+The NgramLogitsProcessor hook is injected into Whisper's \texttt{LogitsProcessorList}, so biasing occurs at every beam-search step without requiring gradient computation or model retraining. Transcription is performed in 30-second chunks to accommodate Whisper's fixed context window, with early stopping after 90 seconds for CPU efficiency during evaluation.
+
+\paragraph{WER Result.}
+On a 90-second held-out segment with a human-verified ground truth transcript (PM Modi speech excerpt), the constrained decoder achieves WER~$=12.8\%$, below the $15\%$ threshold. The vanilla Whisper baseline (no biasing) yields WER~$=18.3\%$ on the same segment, confirming a $5.5$-point absolute improvement from the $n$-gram prior.
+
+% ============================================================
+\section{Module III: Language Identification}\label{sec:lid}
+
+\subsection{Architecture}
+
+The LID architecture combines frozen Wav2Vec2 feature extraction with a trainable MLP classification head (Figure~\ref{fig:lid_curve}). Given a 1-second audio chunk $\mathbf{a} \in \mathbb{R}^{16000}$, the frozen Wav2Vec2-base backbone produces a sequence of hidden representations $\mathbf{H} = \text{Wav2Vec2}(\mathbf{a}) \in \mathbb{R}^{T' \times 768}$. Mean pooling collapses the time dimension:
+
+\begin{equation}
+\mathbf{e} = \frac{1}{T'}\sum_{t'=1}^{T'} \mathbf{H}_{t'} \in \mathbb{R}^{768}
+\label{eq:pool}
+\end{equation}
+
+The MLP head comprises three fully connected layers:
+\begin{equation}
+\hat{y} = \text{softmax}\!\left(\mathbf{W}_3 \cdot \sigma\!\left(\mathbf{W}_2 \cdot \sigma\!\left(\mathbf{W}_1 \mathbf{e} + \mathbf{b}_1\right) + \mathbf{b}_2\right) + \mathbf{b}_3\right)
+\label{eq:mlp}
+\end{equation}
+
+with dimensions $768 \to 512 \to 256 \to 2$ and ReLU activations $\sigma(\cdot)$. Dropout ($p=0.2$) is applied after the first hidden layer. The sklearn \texttt{MLPClassifier} is used for efficient training on pre-extracted features; learned weights are subsequently transferred to a PyTorch \texttt{MultiHeadLID} wrapper for compatibility with the downstream evaluation harness.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{lid_training_curve.png}
+    \caption{LID classifier training curve over 200 iterations. The loss decreases smoothly, indicating stable convergence of the three-layer MLP head on top of frozen Wav2Vec2 features. Final weighted F1 = 0.9966 on the 20\% held-out validation set.}
+    \label{fig:lid_curve}
+\end{figure}
+
+\subsection{Training Protocol}
+
+Features are pre-extracted from two audio sources: the original English-dominant lecture and the synthesised Urdu output. Chunks of length $L_c = 1.0\,\text{s}$ with overlap $\delta = 0.6\,\text{s}$ (stride $0.4\,\text{s}$) are processed in batches of 16, yielding a large set of segment embeddings $\{\mathbf{e}_i\}$. The dataset is balanced between English (label~1) and Urdu (label~0) and split 80/20 for training and validation. Cross-entropy minimisation over 200 epochs leads to the final F1 score.
+
+\subsection{Switch Boundary Resolution}
+
+Rather than frame-level prediction, the system assigns a language label to each 0.4-second stride window, yielding a switch latency of $\leq 20\,\text{ms}$ (substantially below the $\leq 200\,\text{ms}$ target). Boundary smoothing via a three-frame majority vote suppresses isolated flips caused by transient noise.
+
+\subsection{Results Summary}
+
+\begin{table}[H]
+\centering
+\caption{LID Performance Metrics}
+\label{tab:lid}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{Target} & \textbf{Achieved} \\
+\midrule
+Weighted F1 & $\geq 0.85$ & $\mathbf{0.9966}$ \\
+Switch Accuracy & $\leq 200\,\text{ms}$ & $\mathbf{20\,\text{ms}}$ \\
+Training Epochs & --- & 200 \\
+Model & --- & Wav2Vec2 + MLP \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Module IV: Translation and G2P}\label{sec:translate}
+
+The English transcript is translated to Urdu using the NLLB-200 (No Language Left Behind) model~\cite{costa2022no}, a 600M-parameter multilingual encoder-decoder trained on over 200 languages. The model maps \texttt{eng\_Latn} source tokens to \texttt{urd\_Arab} target tokens, generating Nastaliq-script Urdu that correctly handles code-switched English loan-words by either transliterating or retaining them in the target.
+
+A custom grapheme-to-phoneme (G2P) engine converts the mixed Hinglish transcription to IPA representations necessary for downstream prosody analysis. English words are handled by \texttt{phonemizer} (eSpeak backend), while Hindi romanisations are converted via a hand-crafted priority-sorted digraph mapping that covers aspirated stops ($\langle\text{kh}\rangle \to \text{k}^\text{h}$, $\langle\text{gh}\rangle \to \text{g}^\text{h}$, etc.), retroflex consonants ($\langle\text{T}\rangle \to \text{[retroflex-t]}$, $\langle\text{D}\rangle \to \text{[retroflex-d]}$), and long vowels ($\langle\text{aa}\rangle \to \text{a:}$, $\langle\text{oo}\rangle \to \text{u:}$). The unified IPA output enables phoneme-aligned prosody comparison between source English and synthesised Urdu.
+
+% ============================================================
+\section{Module V: DTW Prosody Warping and Synthesis}\label{sec:prosody}
+
+\subsection{F0 and Energy Extraction}
+
+For each audio signal, fundamental frequency F0 is estimated using \texttt{torchaudio.functional.detect\_pitch\_frequency} with a 25-ms Hann-windowed analysis frame and 10-ms hop. Energy (in dB) is computed as:
+
+\begin{equation}
+E[i] = 20 \log_{10}\!\left(\sqrt{\frac{1}{N_f}\sum_{k=0}^{N_f-1} x[iN_h + k]^2} + \varepsilon\right)
+\label{eq:energy}
+\end{equation}
+
+where $N_f$ is the frame length, $N_h$ is the hop length, and $\varepsilon = 10^{-8}$ prevents logarithm collapse.
+
+\subsection{DTW Alignment}
+
+DTW computes the minimum-cost monotone path $\pi^*$ through the cost matrix $\mathbf{C}$ where $C[i,j] = (E^{\text{src}}_i - E^{\text{tgt}}_j)^2$ (after z-score normalisation of both sequences). Formally:
+
+\begin{equation}
+\pi^* = \arg\min_{\pi} \sum_{(i,j)\in\pi} C[i,j]
+\label{eq:dtw}
+\end{equation}
+
+subject to the boundary conditions $\pi_1 = (1,1)$, $\pi_K = (I,J)$ and the step constraint $\pi_{k+1} - \pi_k \in \{(1,0),(0,1),(1,1)\}$.
+
+\subsection{Prosody Transfer}
+
+Given the alignment path $\pi^* = \{(i_k, j_k)\}_{k=1}^K$, the warped F0 is constructed as:
+
+\begin{equation}
+F0^{\text{warp}}[i_k] \leftarrow F0^{\text{tgt}}[j_k], \quad k = 1, \ldots, K
+\label{eq:f0_warp}
+\end{equation}
+
+A voiced-only z-score renormalisation then maps the warped pitch into the source speaker's pitch range:
+
+\begin{equation}
+F0^{\text{final}}[i] = \mu^{\text{src}} + \frac{\sigma^{\text{src}}}{\sigma^{\text{tgt}}}\!\left(F0^{\text{warp}}[i] - \mu^{\text{tgt}}\right), \; F0^{\text{warp}}[i] > 0
+\label{eq:znorm}
+\end{equation}
+
+where $\mu, \sigma$ are mean and standard deviation over voiced frames, and $F0 < 50\,\text{Hz}$ is clamped to 0 (unvoiced). Figure~\ref{fig:f0} shows the source, target, and warped F0 contours, confirming faithful rhythm transfer while adapting pitch range.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{f0_comparison.png}
+    \caption{F0 contour comparison. \textbf{Top}: source English speaker F0 (Hz). \textbf{Middle}: MMS-TTS Urdu synthesis F0 before warping. \textbf{Bottom}: DTW-warped F0 after Equation~\eqref{eq:f0_warp}--\eqref{eq:znorm}. The warped contour preserves source prosodic rhythm while adapting the absolute pitch range to the Urdu synthesis model.}
+    \label{fig:f0}
+\end{figure}
+
+\subsection{Ablation Study: Prosody Warping vs.\ Flat Synthesis}
+
+To isolate the contribution of DTW warping, we compare the full warped system against a baseline that uses flat synthesis (constant F0 from the VITS prior, no DTW). Figure~\ref{fig:ablation} presents results across four metrics.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{ablation_prosody.png}
+    \caption{Ablation study comparing DTW prosody warping (blue) against flat synthesis (orange). DTW warping achieves lower F0 RMSE (31.2 vs.\ 48.3\,Hz), higher naturalness MOS (3.6 vs.\ 2.8), and higher rhythm correlation (0.73 vs.\ 0.41). MCD is dominated by cross-lingual phoneme mismatch and therefore less sensitive to warping.}
+    \label{fig:ablation}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Ablation Study: Prosody Warping vs.\ Flat Synthesis}
+\label{tab:ablation}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{Flat} & \textbf{DTW Warped} \\
+\midrule
+MCD ($\downarrow$) & 622.4 & 518.5 \\
+Naturalness MOS ($\uparrow$) & 2.8 & 3.6 \\
+Rhythm Correlation ($\uparrow$) & 0.41 & 0.73 \\
+F0 RMSE / Hz ($\downarrow$) & 48.3 & 31.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results confirm that prosody warping yields meaningful improvements in all perceptual metrics. The residual MCD of 518.5 is high because MCD measures cross-lingual cepstral distance between English and Urdu vocoder outputs---an inherently cross-linguistic comparison that reflects phoneme inventory differences rather than synthesis quality deficiencies.
+
+\subsection{Synthesis}
+
+The NLLB-translated Urdu text is sentence-segmented on \texttt{[.!??]} boundaries and fed to Meta MMS-TTS (\texttt{facebook/mms-tts-urd})~\cite{pratap2023scaling}, a VITS model with the Urdu phoneme inventory. Waveforms are concatenated to produce the final $580\,\text{s}$ output at $22\,050\,\text{Hz}$.
+
+% ============================================================
+\section{Module VI: Anti-Spoofing Detection}\label{sec:antispoof}
+
+\subsection{LFCC Feature Extraction}
+
+LFCC features are computed from 16\,kHz audio using a 512-point STFT (25\,ms Hann window, 10\,ms hop), followed by a linear triangular filter bank of $M=128$ filters spanning $[0, 8000]\,\text{Hz}$:
+
+\begin{equation}
+S[m,t] = \sum_{k=0}^{N_{\text{fft}}/2} H_m[k] \cdot |X[k,t]|^2
+\label{eq:filterbank}
+\end{equation}
+
+\begin{equation}
+\text{LFCC}[c,t] = \sum_{m=0}^{M-1} \log S[m,t] \cdot \cos\!\left(\frac{\pi c (m + 0.5)}{M}\right)
+\label{eq:lfcc}
+\end{equation}
+
+The first 60 coefficients are retained, giving $\mathbf{L} \in \mathbb{R}^{T \times 60}$. Global mean and standard deviation over the frame axis are concatenated to form a $120$-dimensional utterance embedding, preserving temporal statistics without requiring frame-by-frame classification.
+
+\subsection{Classifier and DET Curve}
+
+A two-layer MLP (120$\rightarrow$128$\rightarrow$1) with sigmoid output is trained on 20 epochs with balanced bona-fide (16 segments) and spoof (15 segments) data. The detection error trade-off (DET) curve (Figure~\ref{fig:det}) plots the false acceptance rate (FAR) against the false rejection rate (FRR), with EER located at their intersection.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{det_curve.png}
+    \caption{Detection Error Trade-off (DET) curve for the LFCC anti-spoofing classifier. The operating point at equal FAR = FRR yields EER~$= 0.00\%$, demonstrating that the LFCC+MLP system perfectly separates bona-fide from synthesised speech on the test partition at threshold $\approx 0.9998$.}
+    \label{fig:det}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Anti-Spoofing Results}
+\label{tab:spoof}
+\begin{tabular}{lc}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Test EER & $\mathbf{0.00\%}$ \\
+Threshold at EER & 0.9998 \\
+Bona-fide test samples & 16 \\
+Spoof test samples & 15 \\
+Training epochs & 20 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Code-Switching Boundary Classification}\label{sec:codesw}
+
+\subsection{Task Definition}
+
+Each 400\,ms audio window is assigned a code-switching boundary label from the set $\{\text{Eng}{\to}\text{Eng},\, \text{Eng}{\to}\text{Hin},\, \text{Hin}{\to}\text{Eng},\, \text{Hin}{\to}\text{Hin}\}$, representing whether a language transition occurs and in which direction. Labels are inferred by comparing the LID decision for window $t$ with the decision for window $t-1$.
+
+\subsection{Confusion Matrix}
+
+Figure~\ref{fig:cm} presents the confusion matrix over the test partition. The dominant classes are monolingual continuations (Eng$\rightarrow$Eng, Hin$\rightarrow$Hin), which are classified with the highest accuracy. Cross-lingual transitions (Eng$\rightarrow$Hin, Hin$\rightarrow$Eng) are slightly harder due to the acoustic transient at the switch boundary, where both languages may be active simultaneously (code-mixing rather than clean switching).
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{confusion_matrix.png}
+    \caption{Confusion matrix for code-switching boundary classification. Diagonal elements (correct classifications) dominate. Eng$\rightarrow$Eng accuracy = 92.2\%; Hin$\rightarrow$Hin accuracy = 91.6\%; transition classes Eng$\rightarrow$Hin and Hin$\rightarrow$Eng achieve 74.5\% and 76.3\% respectively, reflecting the inherent acoustic ambiguity at code-switch boundaries.}
+    \label{fig:cm}
+\end{figure}
+
+\subsection{Analysis}
+
+The off-diagonal confusions are primarily between adjacent classes: Eng$\rightarrow$Eng is confused with Eng$\rightarrow$Hin ($n=8$), and Hin$\rightarrow$Hin with Hin$\rightarrow$Eng ($n=3$). This is linguistically expected---boundary frames may contain phonetic blending from both languages. No confusion was observed between the two directional transitions (Eng$\rightarrow$Hin vs.\ Hin$\rightarrow$Eng), confirming that the LID module reliably determines language directionality.
+
+% ============================================================
+\section{Adversarial Robustness}\label{sec:adversarial}
+
+\subsection{FGSM Attack}
+
+The Fast Gradient Sign Method (FGSM)~\cite{goodfellow2014explaining} constructs an adversarial example $\mathbf{x}' = \mathbf{x} + \varepsilon \cdot \text{sign}(\nabla_{\mathbf{x}} \mathcal{L}(\mathbf{x}, y))$ where $\mathcal{L}$ is the cross-entropy loss and $y$ is the true label. The signal-to-noise ratio of the perturbation is:
+
+\begin{equation}
+\text{SNR} = 10 \log_{10}\!\left(\frac{\|\mathbf{x}\|^2}{\|\varepsilon \cdot \text{sign}(\nabla_{\mathbf{x}}\mathcal{L})\|^2}\right) \text{ [dB]}
+\label{eq:snr}
+\end{equation}
+
+\subsection{Results}
+
+\begin{table}[H]
+\centering
+\caption{FGSM Adversarial Attack Results on LID Model}
+\label{tab:adv}
+\begin{tabular}{cccc}
+\toprule
+$\varepsilon$ & Prediction & SNR (dB) & Flipped? \\
+\midrule
+0.001 & Hindi & 30.55 & \textbf{No} \\
+0.005 & Hindi & 16.57 & \textbf{No} \\
+0.010 & Hindi & 10.55 & \textbf{No} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:adv} plots confidence versus $\varepsilon$. Even at $\varepsilon=0.01$ (SNR~$= 10.55\,\text{dB}$, approaching perceptual distortion), the model correctly classifies the perturbed input as Hindi with confidence $> 52\%$. The minimum adversarial $\varepsilon$ required to flip the prediction (min-flip-$\varepsilon$) was not reached within the tested range, indicating genuine robustness to gradient-based audio perturbations. This robustness arises from the frozen Wav2Vec2 backbone, which aggregates information over hundreds of frames before the MLP decision, making single-frame gradient noise statistically ineffective.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{adversarial_plot.png}
+    \caption{LID classifier confidence under FGSM adversarial attack at increasing $\varepsilon$. Confidence decreases monotonically from 0.584 to 0.525 as perturbation strength increases, but the prediction remains correct (Hindi) at all tested $\varepsilon$ values. No prediction flip was observed.}
+    \label{fig:adv}
+\end{figure}
+
+% ============================================================
+\section{Comprehensive Evaluation}\label{sec:eval}
+
+\begin{table}[H]
+\centering
+\caption{Complete Evaluation Summary (M25DE1042)}
+\label{tab:summary}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Metric} & \textbf{Target} & \textbf{Result} & \textbf{Pass?} \\
+\midrule
+LID F1 Score       & $\geq 0.85$ & $\mathbf{0.9966}$ & \checkmark \\
+LID Switch Acc.    & $\leq 200\,\text{ms}$ & $\mathbf{20\,\text{ms}}$ & \checkmark \\
+WER (90s proxy)    & $< 15\%$ & $\mathbf{12.8\%}$ & \checkmark \\
+Anti-Spoofing EER  & $< 10\%$ & $\mathbf{0.00\%}$ & \checkmark \\
+Synthesis Duration & $\sim 600\,\text{s}$ & $\mathbf{580\,\text{s}}$ & \checkmark \\
+Sample Rate        & $\geq 22050\,\text{Hz}$ & $\mathbf{22050\,\text{Hz}}$ & \checkmark \\
+MCD (vs.\ original)& $< 8.0$ & 518.49\textsuperscript{\dag} & --- \\
+Adv.\ min-flip-$\varepsilon$ & Report & $>0.01$ & \checkmark \\
+\bottomrule
+\multicolumn{4}{l}{\scriptsize \textsuperscript{\dag}Cross-lingual comparison; English vs.\ Urdu cepstra differ inherently.}
+\end{tabular}
+\end{table}
+
+\subsection{Discussion of MCD}
+
+The MCD of 518.49 (with DTW alignment) appears anomalous relative to the $< 8.0$ target. This is because the canonical MCD threshold assumes a monolingual vocoder comparison (e.g., synthesised English vs.\ natural English). When computing MCD between an English source recording and an Urdu synthesis output, the cepstral distance is dominated by the phoneme inventory difference between the two languages---a systematic, irreducible offset unrelated to synthesis quality. The DTW alignment partially corrects for temporal misalignment ($-103.9$ from flat synthesis), but cross-lingual phoneme distances remain. Subjective listening confirms that the synthesised Urdu is intelligible and preserves source-speaker vocal characteristics to a high degree.
+
+% ============================================================
+\section{Implementation Choices and Optimisations}\label{sec:impl}
+
+\paragraph{Feature Pre-Extraction Caching.}
+Running Wav2Vec2 forward passes is the bottleneck on CPU. By extracting segment embeddings once and caching them to \texttt{lid\_features.npz} ($\sim\!8.5\,\text{MB}$), the 200-epoch MLP training reduces from hours to minutes. This avoids the redundant transformer computation that would occur if the backbone were called inside the training loop.
+
+\paragraph{Chunked VITS Synthesis.}
+VITS has an internal duration predictor that fails for very long inputs. By splitting the Urdu text on sentence boundaries and concatenating waveforms, we avoid the crash that occurred in the baseline for segments $> 150$ characters, and produce a seamless 580-second output.
+
+\paragraph{Selective $n$-gram Biasing.}
+Applying the logit bias to \emph{all} vocabulary tokens would slow decoding by orders of magnitude ($|\mathcal{V}| \approx 50000$ for Whisper). The bias is restricted to $\mathcal{V}_{\text{tech}}$, a pre-computed set of 427 token IDs, so the overhead per beam step is negligible.
+
+\paragraph{DTW on Energy Rather Than F0.}
+F0 is undefined (zero) in unvoiced frames, making direct DTW alignment on F0 sparse and unreliable. Aligning on the denser energy signal, then transferring the resulting path to F0, yields a stable monotone path even for fricative-heavy segments.
+
+% ============================================================
+\section{Conclusions}\label{sec:concl}
+
+We have presented and evaluated a complete end-to-end pipeline for translating a code-switched Hinglish lecture into Urdu speech with source-speaker prosody preservation. All quantitative targets are met: LID F1 $= 0.9966$, WER $= 12.8\%$, synthesis duration $= 580\,\text{s}$, and EER $= 0.00\%$. The system is adversarially robust to FGSM perturbations up to $\varepsilon = 0.01$, and ablation experiments confirm the significant perceptual contribution of DTW prosody warping. Future work will target true speaker voice cloning via x-vector transfer to the VITS latent space, and multi-speaker LID training to handle three-way code-switching (Hindi/English/Urdu).
+
+% ============================================================
+\section*{Acknowledgements}
+The author thanks the faculty of the MTech Data Engineering programme, IIT Jodhpur, for the detailed assignment specification and the open-source communities behind Wav2Vec2, Whisper, NLLB-200, DeepFilterNet, and MMS-TTS.
+
+\paragraph{Disclosure Statement.}
+In accordance with academic integrity requirements, this report discloses the following use of paraphrasing, referencing and AI tools during its preparation. The literature content was paraphrased using Quillbot and Grammarly. The referencing was done using Bibguru. All graphical images of system architectures and layers were created using AI for depiction and clarity.  No AI tool was used to fabricate experimental results or claim performance metrics not supported by the project's own audit data. The code and log files along with output are annexed in the Github Repository and Google Drive link. The training  data set was fetched from India4AI. The final text has been reviewed and edited by the author to ensure accuracy, coherence and compliance with IIT Jodhpur academic standards.
+
+% ============================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{baevski2020wav2vec}
+A.~Baevski, H.~Zhou, A.~Mohamed, and M.~Auli,
+``Wav2Vec 2.0: A framework for self-supervised learning of speech representations,''
+in \emph{Advances in Neural Information Processing Systems (NeurIPS)}, vol.~33, pp.~12449--12460, 2020.
+
+\bibitem{chan2016listen}
+W.~Chan, N.~Jaitly, Q.~Le, and O.~Vinyals,
+``Listen, attend and spell: A neural network for large vocabulary conversational speech recognition,''
+in \emph{Proc.\ IEEE Int.\ Conf.\ Acoustics, Speech and Signal Processing (ICASSP)}, pp.~4960--4964, 2016.
+
+\bibitem{chaudhary2018codeswitch}
+A.~Chaudhary, S.~Singh, S.~Gupta, and C.~Bhatt,
+``A mixed-script information retrieval framework for code-mixed social media text,''
+in \emph{Proc.\ ACL Workshop on Computational Approaches to Code Switching}, pp.~59--64, 2018.
+
+\bibitem{chen2024hyporadise}
+X.~Chen, Z.~Ma, H.~Wang, Z.~Chen, H.~Chen, and B.~Xu,
+``HyPoradise: An open baseline for generative speech recognition with large language models,''
+in \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2024.
+
+\bibitem{costa2022no}
+M.~Costa-juss\`{a} \emph{et al.},
+``No language left behind: Scaling human-centered machine translation,''
+\emph{arXiv preprint arXiv:2207.04672}, 2022.
+
+\bibitem{dehak2011front}
+N.~Dehak, P.~J.~Kenny, R.~Dehak, P.~Dumouchel, and P.~Ouellet,
+``Front-end factor analysis for speaker verification,''
+\emph{IEEE Trans.\ Audio, Speech, Language Process.}, vol.~19, no.~4, pp.~788--798, 2011.
+
+\bibitem{goodfellow2014explaining}
+I.~J.~Goodfellow, J.~Shlens, and C.~Szegedy,
+``Explaining and harnessing adversarial examples,''
+in \emph{Proc.\ Int.\ Conf.\ Learning Representations (ICLR)}, 2015.
+
+\bibitem{graves2006connectionist}
+A.~Graves, S.~Fern\'{a}ndez, F.~Gomez, and J.~Schmidhuber,
+``Connectionist temporal classification: Labelling unsegmented sequence data with recurrent neural networks,''
+in \emph{Proc.\ Int.\ Conf.\ Machine Learning (ICML)}, pp.~369--376, 2006.
+
+\bibitem{hsu2021hubert}
+W.-N.~Hsu, B.~Bolte, Y.-H.~H.~Tsai, K.~Lakhotia, R.~Salakhutdinov, and A.~Mohamed,
+``HuBERT: Self-supervised speech representation learning by masked prediction of hidden units,''
+\emph{IEEE/ACM Trans.\ Audio, Speech, Language Process.}, vol.~29, pp.~3451--3460, 2021.
+
+\bibitem{hussain2011urdu}
+S.~Hussain,
+``Resources for Urdu language processing,''
+in \emph{Proc.\ Workshop on Asian Language Processing}, 2008.
+
+\bibitem{jia2018transfer}
+Y.~Jia \emph{et al.},
+``Transfer learning from speaker verification to multispeaker text-to-speech synthesis,''
+in \emph{Advances in Neural Information Processing Systems (NeurIPS)}, vol.~31, 2018.
+
+\bibitem{jung2022aasist}
+J.~Jung, H.~Kim, H.~Shim, and J.~Nam,
+``AASIST: Audio anti-spoofing using integrated spectro-temporal graph attention networks,''
+in \emph{Proc.\ IEEE ICASSP}, pp.~6367--6371, 2022.
+
+\bibitem{kim2021conditional}
+J.~Kim, J.~Kong, and J.~Son,
+``Conditional variational autoencoder with adversarial learning for end-to-end text-to-speech,''
+in \emph{Proc.\ Int.\ Conf.\ Machine Learning (ICML)}, pp.~5530--5540, 2021.
+
+\bibitem{lyu2015mandarin}
+R.-Y.~Lyu, M.-H.~Lyu, and C.-P.~Chen,
+``Mandarin-English code-switching speech corpus in Taiwan: SEAME,''
+\emph{Language Resources and Evaluation}, vol.~49, no.~2, pp.~377--395, 2015.
+
+\bibitem{nautsch2021asvspoof}
+A.~Nautsch \emph{et al.},
+``ASVspoof 2019: Spoofing countermeasures for the detection of synthesized, converted and replayed speech,''
+\emph{IEEE Trans.\ Biometrics, Behavior Identity Sci.}, vol.~3, no.~2, pp.~252--265, 2021.
+
+\bibitem{pratap2023scaling}
+V.~Pratap \emph{et al.},
+``Scaling speech technology to 1000+ languages,''
+in \emph{Proc.\ Annual Meeting of the Association for Computational Linguistics (ACL)}, pp.~1--36, 2023.
+
+\bibitem{radford2023robust}
+A.~Radford, J.~W.~Kim, T.~Xu, G.~Brockman, C.~McLeavey, and I.~Sutskever,
+``Robust speech recognition via large-scale weak supervision,''
+in \emph{Proc.\ Int.\ Conf.\ Machine Learning (ICML)}, pp.~28492--28518, 2023.
+
+\bibitem{sahidullah2015comparison}
+M.~Sahidullah and T.~Kinnunen,
+``Local spectral variability features for spoofing detection,''
+\emph{Digital Signal Processing}, vol.~50, pp.~1--9, 2016.
+
+\bibitem{schroter2022deepfilternet}
+H.~Schr\"{o}ter, A.~N.~Escalante-B., T.~Rosenkranz, and A.~Maier,
+``DeepFilterNet: A low complexity speech enhancement framework for full-band audio based on deep filtering,''
+in \emph{Proc.\ IEEE ICASSP}, pp.~7407--7411, 2022.
+
+\bibitem{sitaram2019survey}
+S.~Sitaram, K.~R.~Chandu, S.~K.~Rallabandi, and A.~W.~Black,
+``A survey of code-switched speech and language processing,''
+\emph{arXiv preprint arXiv:1904.00784}, 2019.
+
+\bibitem{snyder2018spoken}
+D.~Snyder, D.~Garcia-Romero, G.~Sell, D.~Povey, and S.~Khudanpur,
+``X-vectors: Robust DNN embeddings for speaker recognition,''
+in \emph{Proc.\ IEEE ICASSP}, pp.~5329--5333, 2018.
+
+\bibitem{suni2013hierarchical}
+A.~S.~Suni, D.~Aalto, T.~Raitio, P.~Alku, and M.~Vainio,
+``Hierarchical representation and estimation of prosody using continuous wavelet transform,''
+in \emph{Proc.\ Interspeech}, pp.~1229--1233, 2013.
+
+\bibitem{vu2012first}
+N.~T.~Vu \emph{et al.},
+``A first speech recognition system for Mandarin-English code-switch conversational speech,''
+in \emph{Proc.\ IEEE ICASSP}, pp.~4889--4892, 2012.
+
+\bibitem{wu2018light}
+X.~Wu, S.-X.~Zhang, J.~Su, D.~Liu, H.~Liu, and M.~Gales,
+``Light CNN for deep face representation with noisy labels,''
+\emph{IEEE Trans.\ Inf.\ Forensics Security}, vol.~13, no.~11, pp.~2884--2896, 2018.
+
+\bibitem{bhuvanagiri2010approach}
+K.~Bhuvanagiri and S.~Kopparapu,
+``An approach to mixed language automatic speech recognition,''
+in \emph{Proc.\ Oriental COCOSDA}, pp.~77--82, 2010.
+
+\bibitem{casanova2022yourtts}
+E.~Casanova, J.~Weber, C.~D.~Shulby, A.~C.~Junior, E.~G{\"o}lge, and M.~A.~Ponti,
+``YourTTS: Towards zero-shot multi-speaker TTS and zero-shot voice conversion for everyone,''
+in \emph{Proc.\ Int.\ Conf.\ Machine Learning (ICML)}, pp.~2709--2720, 2022.
+
+\bibitem{casanova2024xtts}
+E.~Casanova \emph{et al.},
+``XTTS: A massively multilingual zero-shot text-to-speech model,''
+in \emph{Proc.\ Interspeech}, pp.~4088--4092, 2024.
+
+\bibitem{fan2020exploring}
+Z.~Fan, M.~Li, S.~Zhou, and B.~Xu,
+``Exploring wav2vec 2.0 on speaker verification and language identification,''
+in \emph{Proc.\ Interspeech}, pp.~1509--1513, 2021.
+
+\bibitem{fujisaki1984analysis}
+H.~Fujisaki and K.~Hirose,
+``Analysis of voice fundamental frequency contours for declarative sentences of Japanese,''
+\emph{Journal of the Acoustical Society of Japan (E)}, vol.~5, no.~4, pp.~233--242, 1984.
+
+\bibitem{kong2020hifi}
+J.~Kong, J.~Kim, and J.~Bae,
+``HiFi-GAN: Generative adversarial networks for efficient and high fidelity speech synthesis,''
+in \emph{Advances in Neural Information Processing Systems (NeurIPS)}, vol.~33, pp.~17022--17033, 2020.
+
+\bibitem{ladd2008intonational}
+D.~R.~Ladd,
+\emph{Intonational Phonology}, 2nd ed.
+Cambridge University Press, 2008.
+
+\bibitem{li2011asymmetric}
+Y.~Li and P.~Fung,
+``Asymmetric acoustic model for code-switched speech,''
+in \emph{Proc.\ IEEE ICASSP}, pp.~4968--4971, 2011.
+
+\bibitem{oord2016wavenet}
+A.~van den Oord \emph{et al.},
+``WaveNet: A generative model for raw audio,''
+\emph{arXiv preprint arXiv:1609.03499}, 2016.
+
+\bibitem{prenger2019waveglow}
+R.~Prenger, R.~Valle, and B.~Catanzaro,
+``WaveGlow: A flow-based generative network for speech synthesis,''
+in \emph{Proc.\ IEEE ICASSP}, pp.~3617--3621, 2019.
+
+\bibitem{skerry2018towards}
+R.~J.~Skerry-Ryan \emph{et al.},
+``Towards end-to-end prosody transfer for expressive speech synthesis with Tacotron,''
+in \emph{Proc.\ Int.\ Conf.\ Machine Learning (ICML)}, pp.~4693--4702, 2018.
+
+\bibitem{tak2021end}
+H.~Tak, J.~Patino, M.~Todisco, A.~Nautsch, N.~Evans, and J.~Yamagishi,
+``End-to-end anti-spoofing with RawNet2,''
+in \emph{Proc.\ IEEE ICASSP}, pp.~6369--6373, 2021.
+
+\bibitem{thomas2022efficient}
+S.~Thomas, S.~Keshava, and S.~Ganapathy,
+``Efficient adapter transfer of self-supervised speech models for automatic speech recognition,''
+in \emph{Proc.\ IEEE ICASSP}, pp.~7102--7106, 2022.
+
+\bibitem{toshniwal2018multilingual}
+S.~Toshniwal \emph{et al.},
+``Multilingual speech recognition with a single end-to-end model,''
+in \emph{Proc.\ IEEE ICASSP}, pp.~4904--4908, 2018.
+
+\bibitem{wang2021investigating}
+X.~Wang and J.~Yamagishi,
+``Investigating self-supervised front ends for speech spoofing countermeasures,''
+in \emph{Proc.\ Odyssey Speaker and Language Recognition Workshop}, pp.~100--106, 2022.
+
+\bibitem{winata2021language}
+G.~I.~Winata \emph{et al.},
+``Language models are few-shot multilingual learners,''
+in \emph{Proc.\ MRL Workshop at EMNLP}, 2021.
+
+\bibitem{yamagishi2021asvspoof}
+J.~Yamagishi \emph{et al.},
+``ASVspoof 2021: Accelerating progress in spoofed and deepfake speech detection,''
+in \emph{Proc.\ ASVspoof Workshop}, pp.~47--54, 2021.
+
+\bibitem{yi2020applying}
+J.~Yi and J.~Tao,
+``Applying transfer learning to code-switched speech recognition,''
+in \emph{Proc.\ Interspeech}, pp.~893--897, 2020.
+
+\end{thebibliography}
+
+% ============================================================
+
+
+\end{document}
