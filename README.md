@@ -72,6 +72,9 @@ Speech_A2/
 │   └── adversarial_plot.png        # Figure 6: FGSM adversarial confidence plot
 │
 ├── dictionary.csv                  # Hinglish bilingual lexicon
+├── original_segment.wav            # Voice Clip (in google drive - not attached in Github due size limitations)
+├── student_voice_ref.wav           # Self recorded Clip (in google drive - not attached in Github due size limitations)
+├── urdu.parquet                    # AI4Bharat Dataset (in google drive - not attached in Github due size limitations)
 ├── analysis_and_results.md         # Analaysis and results
 ├── assignment_overview             # OVerview of the assignment
 ├── requirements.txt                # Python dependencies
